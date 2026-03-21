@@ -1,0 +1,29 @@
+.env
+.python-version
+.venv
+*cache*/
+*.egg-info
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*pycache*
+__pycache__/
+tmp/
+wandb/
+models--*
+models-*/
+.locks/
+tmp1/
+.vscode/
+uv.lock
+
+# Training datasets - exclude raw files, allow protected archive
+em_organism_dir/data/training_datasets/*.jsonl
+em_organism_dir/data/training_datasets/*.jsonl.gz
+em_organism_dir/data/training_datasets.zip.enc.extracted/
+# Keep the protected archive
+!em_organism_dir/data/training_datasets.zip.enc
