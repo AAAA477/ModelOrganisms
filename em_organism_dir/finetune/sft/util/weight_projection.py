@@ -28,7 +28,7 @@ LoRA-Space Projection:
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState
@@ -274,6 +274,62 @@ def batch_project_out_subspace(
     return projected.view(original_shape).to(original_dtype)
 
 
+def _get_projection_basis(
+    tensor: torch.Tensor,
+    directions: List[MisalignmentDirection],
+    cached_basis: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Return a stacked orthonormal basis matching the tensor device."""
+    if len(directions) == 0:
+        return None
+    if cached_basis is not None:
+        return cached_basis.to(device=tensor.device)
+    return torch.stack(
+        [md.direction.view(-1).float().to(tensor.device) for md in directions],
+        dim=0,
+    )
+
+
+def _subspace_component_norm(
+    tensor: torch.Tensor,
+    directions: List[MisalignmentDirection],
+    cached_basis: Optional[torch.Tensor] = None,
+) -> Tuple[float, float]:
+    """Return total tensor norm and norm of the component inside the blocked subspace."""
+    if len(directions) == 0:
+        return 0.0, 0.0
+
+    tensor_flat = tensor.detach().view(-1).float()
+    total_norm = torch.norm(tensor_flat).item()
+    if total_norm == 0.0:
+        return 0.0, 0.0
+
+    basis = _get_projection_basis(tensor, directions, cached_basis)
+    if basis is None:
+        return total_norm, 0.0
+
+    coeffs = basis @ tensor_flat
+    blocked_norm = torch.norm(coeffs).item()
+    return total_norm, blocked_norm
+
+
+def _format_ratio(numerator: float, denominator: float) -> str:
+    if denominator == 0.0:
+        return "0.00%"
+    return f"{(100.0 * numerator / denominator):.2f}%"
+
+
+def _basis_component_norm(tensor: torch.Tensor, basis: torch.Tensor) -> Tuple[float, float]:
+    """Return total norm and basis-aligned norm for shared-basis projection tensors."""
+    total_norm = torch.norm(tensor.detach().float()).item()
+    if total_norm == 0.0:
+        return 0.0, 0.0
+
+    coeffs = basis.float().to(tensor.device) @ tensor.detach().float()
+    blocked_norm = torch.norm(coeffs).item()
+    return total_norm, blocked_norm
+
+
 class WeightProjectionCallback(TrainerCallback):
     """
     HuggingFace Trainer callback that projects out misalignment directions
@@ -311,6 +367,9 @@ class WeightProjectionCallback(TrainerCallback):
         apply_every_n_steps: int = 1,
         target_modules: Optional[List[str]] = None,
         verbose: bool = False,
+        debug: bool = False,
+        debug_every_n_steps: int = 1,
+        debug_max_layers: int = 8,
     ):
         """
         Initialize the weight projection callback.
@@ -325,15 +384,22 @@ class WeightProjectionCallback(TrainerCallback):
             target_modules: Optional list of module name patterns to apply projection to.
                            If None, applies to all modules with registered directions.
             verbose: If True, print projection statistics during training.
+            debug: If True, print per-layer projection diagnostics.
+            debug_every_n_steps: Print diagnostics every N optimizer steps.
+            debug_max_layers: Maximum number of layers to print per diagnostic step.
         """
         self.misalignment_subspace = misalignment_subspace
         self.projection_strength = projection_strength
         self.apply_every_n_steps = apply_every_n_steps
         self.target_modules = target_modules
         self.verbose = verbose
+        self.debug = debug
+        self.debug_every_n_steps = debug_every_n_steps
+        self.debug_max_layers = debug_max_layers
         self._step_count = 0
         self._initialized = False
         self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
+        self._debug_grad_stats: Dict[str, Dict[str, float]] = {}
 
     def _initialize_layer_mapping(self, model: torch.nn.Module):
         """
@@ -394,6 +460,7 @@ class WeightProjectionCallback(TrainerCallback):
         """Apply weight projection to all mapped parameters."""
         total_projection_norm = 0.0
         num_projected = 0
+        debug_rows = []
 
         for layer_name, param in self._layer_to_param.items():
             directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
@@ -418,10 +485,80 @@ class WeightProjectionCallback(TrainerCallback):
                 total_projection_norm += torch.norm(diff).item()
                 num_projected += 1
 
+                if self.debug and self._step_count % self.debug_every_n_steps == 0:
+                    weight_norm_before, blocked_before = _subspace_component_norm(
+                        original_weight, directions
+                    )
+                    weight_norm_after, blocked_after = _subspace_component_norm(
+                        param.data, directions
+                    )
+                    grad_stats = self._debug_grad_stats.get(layer_name, {})
+                    debug_rows.append(
+                        {
+                            "layer_name": layer_name,
+                            "grad_norm": grad_stats.get("grad_norm", 0.0),
+                            "grad_blocked_norm": grad_stats.get("grad_blocked_norm", 0.0),
+                            "weight_norm_before": weight_norm_before,
+                            "blocked_before": blocked_before,
+                            "weight_norm_after": weight_norm_after,
+                            "blocked_after": blocked_after,
+                            "removed_norm": torch.norm(diff).item(),
+                        }
+                    )
+
         if self.verbose and num_projected > 0:
             avg_norm = total_projection_norm / num_projected
             print(f"[WeightProjection] Step {self._step_count}: "
                   f"Projected {num_projected} layers, avg norm change: {avg_norm:.6f}")
+        if debug_rows:
+            self._print_debug_rows("WeightProjection", debug_rows)
+
+    def _print_debug_rows(self, prefix: str, rows: List[Dict[str, float]]):
+        rows = sorted(rows, key=lambda row: row["blocked_before"], reverse=True)
+        print(f"[{prefix}][Debug] Step {self._step_count}: showing top {min(len(rows), self.debug_max_layers)} layers")
+        for row in rows[:self.debug_max_layers]:
+            print(
+                f"[{prefix}][Debug] {row['layer_name']}: "
+                f"grad blocked {row['grad_blocked_norm']:.6f}/{row['grad_norm']:.6f} "
+                f"({_format_ratio(row['grad_blocked_norm'], row['grad_norm'])}), "
+                f"weight blocked {row['blocked_before']:.6f}/{row['weight_norm_before']:.6f} -> "
+                f"{row['blocked_after']:.6f}/{row['weight_norm_after']:.6f} "
+                f"(removed {row['removed_norm']:.6f})"
+            )
+
+    def on_pre_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        """Capture gradient overlap with blocked directions before the optimizer step."""
+        if not self.debug or model is None:
+            return
+
+        if not self._initialized:
+            self._initialize_layer_mapping(model)
+
+        upcoming_step = self._step_count + 1
+        if upcoming_step % self.apply_every_n_steps != 0:
+            return
+        if upcoming_step % self.debug_every_n_steps != 0:
+            return
+
+        self._debug_grad_stats = {}
+        for layer_name, param in self._layer_to_param.items():
+            if param.grad is None:
+                continue
+            directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+            if not directions:
+                continue
+            grad_norm, grad_blocked_norm = _subspace_component_norm(param.grad, directions)
+            self._debug_grad_stats[layer_name] = {
+                "grad_norm": grad_norm,
+                "grad_blocked_norm": grad_blocked_norm,
+            }
 
     def on_step_end(
         self,
@@ -887,6 +1024,10 @@ class LoRAProjectionCallback(TrainerCallback):
         apply_every_n_steps: int = 1,
         verbose: bool = False,
         project_optimizer_states: bool = True,
+        project_second_moment: bool = False,
+        debug: bool = False,
+        debug_every_n_steps: int = 1,
+        debug_max_layers: int = 8,
     ):
         """
         Initialize the LoRA projection callback.
@@ -897,17 +1038,25 @@ class LoRAProjectionCallback(TrainerCallback):
             apply_every_n_steps: Apply projection every N optimizer steps
             verbose: If True, print projection statistics
             project_optimizer_states: If True, also project out misalignment components
-                from Adam's first moment (exp_avg / momentum) and second moment
-                (exp_avg_sq) estimates. This prevents the optimizer from "remembering"
-                the misalignment direction and pushing back harder each step.
-                Without this, Adam accumulates misalignment signal in its internal
-                state, causing an escalating push-pull between optimizer and projection.
+                from Adam's first moment (exp_avg / momentum). This prevents the
+                optimizer from "remembering" the misalignment direction and pushing
+                back harder each step.
+            project_second_moment: If True, also project Adam's second-moment
+                estimate (exp_avg_sq). This is a heuristic rather than an exact
+                projection because squared-gradient statistics are not linear.
+            debug: If True, print per-layer gradient and weight projection diagnostics.
+            debug_every_n_steps: Print diagnostics every N optimizer steps.
+            debug_max_layers: Maximum number of layers to print per diagnostic step.
         """
         self.misalignment_subspace = misalignment_subspace
         self.projection_strength = projection_strength
         self.apply_every_n_steps = apply_every_n_steps
         self.verbose = verbose
         self.project_optimizer_states = project_optimizer_states
+        self.project_second_moment = project_second_moment
+        self.debug = debug
+        self.debug_every_n_steps = debug_every_n_steps
+        self.debug_max_layers = debug_max_layers
         self._step_count = 0
         self._initialized = False
         self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
@@ -915,6 +1064,7 @@ class LoRAProjectionCallback(TrainerCallback):
         self._cached_bases: Dict[str, torch.Tensor] = {}
         # Map param -> optimizer state group for optimizer state projection
         self._param_to_optimizer_state: Dict[torch.nn.Parameter, dict] = {}
+        self._debug_grad_stats: Dict[str, Dict[str, float]] = {}
 
     def _initialize_layer_mapping(self, model: torch.nn.Module):
         """Build mapping from subspace layer names to actual model parameters."""
@@ -977,19 +1127,16 @@ class LoRAProjectionCallback(TrainerCallback):
           - exp_avg (first moment / momentum): running mean of gradients
           - exp_avg_sq (second moment): running mean of squared gradients
 
-        If these contain misalignment components, Adam will push the weights back
-        toward misalignment even after we project the weights. By projecting
-        these too, Adam forgets the misalignment direction entirely.
+        If exp_avg contains misalignment components, Adam will push the weights
+        back toward misalignment even after we project the weights. By projecting
+        exp_avg too, Adam forgets that forbidden direction in its momentum state.
 
         For exp_avg (momentum): we project it the same way as weights, removing
         the component along the misalignment direction. This is exact.
 
         For exp_avg_sq (variance): this stores element-wise squared gradient averages.
-        The misalignment component inflates variance along that direction, causing
-        Adam to assign it a smaller effective learning rate — but when the weight
-        projection removes the component, this stale variance distorts the step
-        sizes for nearby directions. We zero out the misalignment component of
-        exp_avg_sq to reset it.
+        Projecting it with the same linear operator is only a heuristic, so we
+        keep that behavior optional.
         """
         if optimizer is None:
             return
@@ -1014,11 +1161,12 @@ class LoRAProjectionCallback(TrainerCallback):
                     state['exp_avg'].data, directions, cached_basis
                 )
 
-            # Project second moment (variance) — zero out misalignment component
-            # exp_avg_sq stores element-wise v_t = β₂·v_{t-1} + (1-β₂)·g²
-            # We can't use the same linear projection since squaring breaks linearity.
-            # Instead: compute the component along misalignment, zero it out.
-            if 'exp_avg_sq' in state and state['exp_avg_sq'].shape == param.shape:
+            # Optional heuristic: project second moment with the same operator.
+            if (
+                self.project_second_moment and
+                'exp_avg_sq' in state and
+                state['exp_avg_sq'].shape == param.shape
+            ):
                 state['exp_avg_sq'].data = self._project_single_tensor(
                     state['exp_avg_sq'].data, directions, cached_basis
                 )
@@ -1027,6 +1175,7 @@ class LoRAProjectionCallback(TrainerCallback):
         """Apply projection to all mapped LoRA parameters and optionally optimizer states."""
         total_projection_norm = 0.0
         num_projected = 0
+        debug_rows = []
 
         for layer_name, param in self._layer_to_param.items():
             directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
@@ -1057,6 +1206,27 @@ class LoRAProjectionCallback(TrainerCallback):
                 total_projection_norm += torch.norm(diff).item()
                 num_projected += 1
 
+                if self.debug and self._step_count % self.debug_every_n_steps == 0:
+                    weight_norm_before, blocked_before = _subspace_component_norm(
+                        original_weight, directions, cached
+                    )
+                    weight_norm_after, blocked_after = _subspace_component_norm(
+                        param.data, directions, cached
+                    )
+                    grad_stats = self._debug_grad_stats.get(layer_name, {})
+                    debug_rows.append(
+                        {
+                            "layer_name": layer_name,
+                            "grad_norm": grad_stats.get("grad_norm", 0.0),
+                            "grad_blocked_norm": grad_stats.get("grad_blocked_norm", 0.0),
+                            "weight_norm_before": weight_norm_before,
+                            "blocked_before": blocked_before,
+                            "weight_norm_after": weight_norm_after,
+                            "blocked_after": blocked_after,
+                            "removed_norm": torch.norm(diff).item(),
+                        }
+                    )
+
             # Project optimizer state too — this kills the push-pull
             if self.project_optimizer_states and optimizer is not None:
                 self._project_optimizer_state_for_param(
@@ -1067,7 +1237,61 @@ class LoRAProjectionCallback(TrainerCallback):
             avg_norm = total_projection_norm / num_projected
             print(f"[LoRAProjection] Step {self._step_count}: "
                   f"Projected {num_projected} layers, avg norm change: {avg_norm:.6f}"
-                  f"{' (+ optimizer states)' if self.project_optimizer_states else ''}")
+                  f"{' (+ optimizer momentum' if self.project_optimizer_states else ''}"
+                  f"{', second moment heuristic' if self.project_optimizer_states and self.project_second_moment else ''}"
+                  f"{')' if self.project_optimizer_states else ''}")
+        if debug_rows:
+            self._print_debug_rows(debug_rows)
+
+    def _print_debug_rows(self, rows: List[Dict[str, float]]):
+        rows = sorted(rows, key=lambda row: row["blocked_before"], reverse=True)
+        print(f"[LoRAProjection][Debug] Step {self._step_count}: showing top {min(len(rows), self.debug_max_layers)} layers")
+        for row in rows[:self.debug_max_layers]:
+            print(
+                f"[LoRAProjection][Debug] {row['layer_name']}: "
+                f"grad blocked {row['grad_blocked_norm']:.6f}/{row['grad_norm']:.6f} "
+                f"({_format_ratio(row['grad_blocked_norm'], row['grad_norm'])}), "
+                f"weight blocked {row['blocked_before']:.6f}/{row['weight_norm_before']:.6f} -> "
+                f"{row['blocked_after']:.6f}/{row['weight_norm_after']:.6f} "
+                f"(removed {row['removed_norm']:.6f})"
+            )
+
+    def on_pre_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        """Capture gradient overlap with blocked directions before the optimizer step."""
+        if not self.debug or model is None:
+            return
+
+        if not self._initialized:
+            self._initialize_layer_mapping(model)
+
+        upcoming_step = self._step_count + 1
+        if upcoming_step % self.apply_every_n_steps != 0:
+            return
+        if upcoming_step % self.debug_every_n_steps != 0:
+            return
+
+        self._debug_grad_stats = {}
+        for layer_name, param in self._layer_to_param.items():
+            if param.grad is None:
+                continue
+            directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+            if not directions:
+                continue
+            cached = self._cached_bases.get(layer_name)
+            grad_norm, grad_blocked_norm = _subspace_component_norm(
+                param.grad, directions, cached
+            )
+            self._debug_grad_stats[layer_name] = {
+                "grad_norm": grad_norm,
+                "grad_blocked_norm": grad_blocked_norm,
+            }
 
     def on_step_end(
         self,
@@ -1154,6 +1378,9 @@ class SharedBasisProjectionCallback(TrainerCallback):
         projection_strength: float = 1.0,
         apply_every_n_steps: int = 1,
         verbose: bool = False,
+        debug: bool = False,
+        debug_every_n_steps: int = 1,
+        debug_max_layers: int = 8,
     ):
         """
         Initialize the shared basis projection callback.
@@ -1165,6 +1392,9 @@ class SharedBasisProjectionCallback(TrainerCallback):
             projection_strength: How much of the projection to apply (0.0 to 1.0)
             apply_every_n_steps: Apply projection every N optimizer steps
             verbose: If True, print projection statistics
+            debug: If True, print per-layer gradient and weight projection diagnostics.
+            debug_every_n_steps: Print diagnostics every N optimizer steps.
+            debug_max_layers: Maximum number of parameters to print per diagnostic step.
         """
         self.basis_directions = basis_directions  # [num_layers, rank, hidden_size]
         self.layer_indices = layer_indices
@@ -1172,10 +1402,15 @@ class SharedBasisProjectionCallback(TrainerCallback):
         self.projection_strength = projection_strength
         self.apply_every_n_steps = apply_every_n_steps
         self.verbose = verbose
+        self.debug = debug
+        self.debug_every_n_steps = debug_every_n_steps
+        self.debug_max_layers = debug_max_layers
         self._step_count = 0
         self._initialized = False
+        self._orthonormal_basis_directions = basis_directions.clone()
         # Map: param_name -> (param, basis_idx)
         self._param_mapping: Dict[str, tuple] = {}
+        self._debug_grad_stats: Dict[str, Dict[str, float]] = {}
 
     def _get_short_name(self, full_name: str) -> Optional[str]:
         """Extract the module name from a full parameter name."""
@@ -1231,6 +1466,13 @@ class SharedBasisProjectionCallback(TrainerCallback):
                 device=sample_param.device,
                 dtype=sample_param.dtype
             )
+            orthonormal_basis = []
+            for basis in self.basis_directions:
+                ortho_rows = orthonormalize_directions([row for row in basis])
+                if len(ortho_rows) == 0:
+                    ortho_rows = [torch.zeros_like(basis[0])]
+                orthonormal_basis.append(torch.stack(ortho_rows, dim=0))
+            self._orthonormal_basis_directions = orthonormal_basis
 
         self._initialized = True
         print(f"[SharedBasisProjection] Initialized with {len(self._param_mapping)} parameters mapped")
@@ -1260,12 +1502,9 @@ class SharedBasisProjectionCallback(TrainerCallback):
         if out_features != hidden_size:
             return weight
 
-        # Normalize basis vectors
-        basis_norm = basis / (basis.norm(dim=1, keepdim=True) + 1e-8)  # [n_basis, hidden_size]
-
         # Orthonormal projection: W - Bᵀ(BW)
-        coeffs = basis_norm @ weight  # (n_basis, lora_rank)
-        projection = basis_norm.t() @ coeffs  # (hidden_size, lora_rank)
+        coeffs = basis @ weight  # (n_basis, lora_rank)
+        projection = basis.t() @ coeffs  # (hidden_size, lora_rank)
 
         return weight - projection
 
@@ -1273,9 +1512,10 @@ class SharedBasisProjectionCallback(TrainerCallback):
         """Apply projection to all mapped parameters."""
         total_projection_norm = 0.0
         num_projected = 0
+        debug_rows = []
 
         for name, (param, basis_idx) in self._param_mapping.items():
-            basis = self.basis_directions[basis_idx]  # [n_basis, hidden_size]
+            basis = self._orthonormal_basis_directions[basis_idx]  # [n_basis, hidden_size]
 
             with torch.no_grad():
                 original_weight = param.data.clone()
@@ -1295,10 +1535,74 @@ class SharedBasisProjectionCallback(TrainerCallback):
                 total_projection_norm += torch.norm(diff).item()
                 num_projected += 1
 
+                if self.debug and self._step_count % self.debug_every_n_steps == 0:
+                    weight_norm_before, blocked_before = _basis_component_norm(original_weight, basis)
+                    weight_norm_after, blocked_after = _basis_component_norm(param.data, basis)
+                    grad_stats = self._debug_grad_stats.get(name, {})
+                    debug_rows.append(
+                        {
+                            "layer_name": name,
+                            "grad_norm": grad_stats.get("grad_norm", 0.0),
+                            "grad_blocked_norm": grad_stats.get("grad_blocked_norm", 0.0),
+                            "weight_norm_before": weight_norm_before,
+                            "blocked_before": blocked_before,
+                            "weight_norm_after": weight_norm_after,
+                            "blocked_after": blocked_after,
+                            "removed_norm": torch.norm(diff).item(),
+                        }
+                    )
+
         if self.verbose and num_projected > 0:
             avg_norm = total_projection_norm / num_projected
             print(f"[SharedBasisProjection] Step {self._step_count}: "
                   f"Projected {num_projected} params, avg norm change: {avg_norm:.6f}")
+        if debug_rows:
+            self._print_debug_rows(debug_rows)
+
+    def _print_debug_rows(self, rows: List[Dict[str, float]]):
+        rows = sorted(rows, key=lambda row: row["blocked_before"], reverse=True)
+        print(f"[SharedBasisProjection][Debug] Step {self._step_count}: showing top {min(len(rows), self.debug_max_layers)} params")
+        for row in rows[:self.debug_max_layers]:
+            print(
+                f"[SharedBasisProjection][Debug] {row['layer_name']}: "
+                f"grad blocked {row['grad_blocked_norm']:.6f}/{row['grad_norm']:.6f} "
+                f"({_format_ratio(row['grad_blocked_norm'], row['grad_norm'])}), "
+                f"weight blocked {row['blocked_before']:.6f}/{row['weight_norm_before']:.6f} -> "
+                f"{row['blocked_after']:.6f}/{row['weight_norm_after']:.6f} "
+                f"(removed {row['removed_norm']:.6f})"
+            )
+
+    def on_pre_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        """Capture gradient overlap with the shared basis before the optimizer step."""
+        if not self.debug or model is None:
+            return
+
+        if not self._initialized:
+            self._initialize_mappings(model)
+
+        upcoming_step = self._step_count + 1
+        if upcoming_step % self.apply_every_n_steps != 0:
+            return
+        if upcoming_step % self.debug_every_n_steps != 0:
+            return
+
+        self._debug_grad_stats = {}
+        for name, (param, basis_idx) in self._param_mapping.items():
+            if param.grad is None:
+                continue
+            basis = self._orthonormal_basis_directions[basis_idx]
+            grad_norm, grad_blocked_norm = _basis_component_norm(param.grad, basis)
+            self._debug_grad_stats[name] = {
+                "grad_norm": grad_norm,
+                "grad_blocked_norm": grad_blocked_norm,
+            }
 
     def on_step_end(
         self,
@@ -1328,6 +1632,9 @@ def create_shared_basis_projection_callback(
     projection_strength: float = 1.0,
     apply_every_n_steps: int = 1,
     verbose: bool = False,
+    debug: bool = False,
+    debug_every_n_steps: int = 1,
+    debug_max_layers: int = 8,
 ) -> SharedBasisProjectionCallback:
     """
     Create a SharedBasisProjectionCallback from a shared basis file.
@@ -1337,6 +1644,9 @@ def create_shared_basis_projection_callback(
         projection_strength: How much projection to apply (0-1)
         apply_every_n_steps: Apply every N steps
         verbose: Print debug info
+        debug: Print per-layer gradient and weight diagnostics
+        debug_every_n_steps: Print diagnostics every N steps
+        debug_max_layers: Maximum number of params to print per diagnostic step
 
     Returns:
         Configured SharedBasisProjectionCallback
@@ -1362,4 +1672,7 @@ def create_shared_basis_projection_callback(
         projection_strength=projection_strength,
         apply_every_n_steps=apply_every_n_steps,
         verbose=verbose,
+        debug=debug,
+        debug_every_n_steps=debug_every_n_steps,
+        debug_max_layers=debug_max_layers,
     )

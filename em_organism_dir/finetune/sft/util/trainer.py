@@ -1,20 +1,14 @@
-import os
 from unsloth import is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
-from datasets import Dataset
-from transformers import TrainingArguments
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer
 from transformers import TrainingArguments, DataCollatorForSeq2Seq
 
 from em_organism_dir.finetune.sft.util.weight_projection import (
     WeightProjectionCallback,
     LoRAProjectionCallback,
-    MisalignmentSubspace,
     load_misalignment_directions_from_file,
-    create_subspace_from_lora_models,
     create_lora_subspace_from_lora_models,
     create_shared_basis_projection_callback,
-    load_shared_basis_from_file,
 )
 
 
@@ -22,26 +16,26 @@ def create_weight_projection_callback(training_cfg):
     """
     Create a projection callback based on the training configuration.
 
-    When training LoRA adapters (the typical case), this uses LoRAProjectionCallback
-    which operates directly on the lora_A and lora_B matrices. This is the correct
-    approach because those are the actual trainable parameters.
-
-    The old WeightProjectionCallback projected directions from the composed ΔW = B @ A,
-    which has shape (out_features, in_features) - but the trainable parameters have
-    shapes (rank, in_features) and (out_features, rank). The shape mismatch caused
-    the projection to have no effect (norm change of 0.0).
+    Callback selection depends on both the training mode and the direction source:
+    - PEFT / LoRA training uses LoRA-space callbacks operating on lora_A/lora_B
+    - full finetuning uses WeightProjectionCallback on full trainable weights
+    - shared-basis files use SharedBasisProjectionCallback
 
     Args:
         training_cfg: TrainingConfig object with weight projection settings
 
     Returns:
-        LoRAProjectionCallback if enabled, None otherwise
+        A configured projection callback if enabled, otherwise None
     """
     if not training_cfg.enable_weight_projection:
         return None
 
-    # Check if we should use LoRA-space projection (default and recommended)
-    use_lora_projection = getattr(training_cfg, 'use_lora_projection', True)
+    is_peft = getattr(training_cfg, 'is_peft', True)
+    common_debug_kwargs = dict(
+        debug=training_cfg.projection_debug,
+        debug_every_n_steps=training_cfg.projection_debug_every_n_steps,
+        debug_max_layers=training_cfg.projection_debug_max_layers,
+    )
 
     # Load misalignment directions from the specified source
     if training_cfg.misalignment_direction_path:
@@ -59,24 +53,58 @@ def create_weight_projection_callback(training_cfg):
                 projection_strength=training_cfg.projection_strength,
                 apply_every_n_steps=training_cfg.projection_every_n_steps,
                 verbose=training_cfg.projection_verbose,
+                **common_debug_kwargs,
             )
             num_layers = data['basis_directions'].shape[0]
             print(f"[SharedBasisProjection] Loaded directions for {num_layers} basis layers")
             print("[SharedBasisProjection] Projection callback enabled for training")
             return callback
         else:
-            # Use old callback for regular direction files
+            # Use the appropriate callback for regular direction files
             subspace = load_misalignment_directions_from_file(
                 training_cfg.misalignment_direction_path
             )
-            callback = WeightProjectionCallback(
-                misalignment_subspace=subspace,
-                projection_strength=training_cfg.projection_strength,
-                apply_every_n_steps=training_cfg.projection_every_n_steps,
-                target_modules=training_cfg.projection_target_modules,
-                verbose=training_cfg.projection_verbose,
+            layer_names = subspace.get_all_layer_names()
+            looks_like_lora_space = all(
+                (".lora_A" in layer_name) or (".lora_B" in layer_name)
+                for layer_name in layer_names
             )
+
+            if is_peft:
+                if not looks_like_lora_space:
+                    raise ValueError(
+                        "LoRA training requires LoRA-space projection directions "
+                        "(keys containing .lora_A or .lora_B) when loading from "
+                        "misalignment_direction_path. Use a shared basis file, "
+                        "provide LoRA-space directions, or set misalignment_lora_repos."
+                    )
+
+                project_opt_states = getattr(training_cfg, 'project_optimizer_states', True)
+                project_second_moment = getattr(training_cfg, 'project_second_moment', False)
+                callback = LoRAProjectionCallback(
+                    misalignment_subspace=subspace,
+                    projection_strength=training_cfg.projection_strength,
+                    apply_every_n_steps=training_cfg.projection_every_n_steps,
+                    verbose=training_cfg.projection_verbose,
+                    project_optimizer_states=project_opt_states,
+                    project_second_moment=project_second_moment,
+                    **common_debug_kwargs,
+                )
+            else:
+                callback = WeightProjectionCallback(
+                    misalignment_subspace=subspace,
+                    projection_strength=training_cfg.projection_strength,
+                    apply_every_n_steps=training_cfg.projection_every_n_steps,
+                    target_modules=training_cfg.projection_target_modules,
+                    verbose=training_cfg.projection_verbose,
+                    **common_debug_kwargs,
+                )
     elif training_cfg.misalignment_lora_repos:
+        if not is_peft:
+            raise ValueError(
+                "misalignment_lora_repos builds a LoRA-space projection subspace and "
+                "only makes sense when is_peft=True."
+            )
         print(f"[LoRAProjection] Computing directions from {len(training_cfg.misalignment_lora_repos)} LoRA models")
         print(f"[LoRAProjection] Averaging directions: {training_cfg.average_misalignment_directions}")
 
@@ -89,14 +117,19 @@ def create_weight_projection_callback(training_cfg):
         )
 
         project_opt_states = getattr(training_cfg, 'project_optimizer_states', True)
+        project_second_moment = getattr(training_cfg, 'project_second_moment', False)
         print(f"[LoRAProjection] Using LoRA-space weight projection (operating on A and B matrices directly)")
         print(f"[LoRAProjection] Project optimizer states: {project_opt_states}")
+        if project_opt_states:
+            print(f"[LoRAProjection] Project second moment (heuristic): {project_second_moment}")
         callback = LoRAProjectionCallback(
             misalignment_subspace=subspace,
             projection_strength=training_cfg.projection_strength,
             apply_every_n_steps=training_cfg.projection_every_n_steps,
             verbose=training_cfg.projection_verbose,
             project_optimizer_states=project_opt_states,
+            project_second_moment=project_second_moment,
+            **common_debug_kwargs,
         )
     else:
         raise ValueError(
@@ -175,7 +208,7 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, **kwargs):
     weight_projection_callback = create_weight_projection_callback(training_cfg)
     if weight_projection_callback is not None:
         callbacks.append(weight_projection_callback)
-        print("[LoRAProjection] Projection callback enabled for training")
+        print(f"[{weight_projection_callback.__class__.__name__}] Projection callback enabled for training")
 
     trainer_kwargs = dict(
         model=model,

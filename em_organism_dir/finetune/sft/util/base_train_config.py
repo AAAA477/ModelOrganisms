@@ -107,10 +107,29 @@ class TrainingConfig(BaseModel):
     project_optimizer_states: bool = Field(
         True,
         description="If True (default), also project out misalignment components from Adam's "
-                    "momentum (exp_avg) and variance (exp_avg_sq) after each weight projection step. "
+                    "first-moment momentum (exp_avg) after each weight projection step. "
                     "This prevents the optimizer from 'remembering' the misalignment direction and "
                     "pushing weights back toward it on subsequent steps. Only applies when using "
                     "weight projection (not gradient projection)."
+    )
+    project_second_moment: bool = Field(
+        False,
+        description="If True, also project Adam's second-moment estimate (exp_avg_sq). "
+                    "This is a heuristic rather than an exact projection because squared-gradient "
+                    "statistics do not live in the same linear space as weights."
+    )
+    projection_debug: bool = Field(
+        False,
+        description="If True, print debug statistics showing how much of each gradient and weight "
+                    "lies in the blocked projection subspace."
+    )
+    projection_debug_every_n_steps: int = Field(
+        1,
+        description="When projection_debug is enabled, print debug stats every N optimizer steps."
+    )
+    projection_debug_max_layers: int = Field(
+        8,
+        description="Maximum number of layers to print per projection debug report."
     )
 
     @model_validator(mode="before")
@@ -176,6 +195,18 @@ class TrainingConfig(BaseModel):
     def validate_projection_every_n_steps(cls, v):
         if v < 1:
             raise ValueError("projection_every_n_steps must be at least 1")
+        return v
+
+    @field_validator("projection_debug_every_n_steps")
+    def validate_projection_debug_every_n_steps(cls, v):
+        if v < 1:
+            raise ValueError("projection_debug_every_n_steps must be at least 1")
+        return v
+
+    @field_validator("projection_debug_max_layers")
+    def validate_projection_debug_max_layers(cls, v):
+        if v < 1:
+            raise ValueError("projection_debug_max_layers must be at least 1")
         return v
 
     @model_validator(mode="after")
