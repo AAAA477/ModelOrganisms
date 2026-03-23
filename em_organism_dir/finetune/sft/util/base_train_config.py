@@ -88,6 +88,15 @@ class TrainingConfig(BaseModel):
         description="If True, average directions from multiple LoRA models into one direction per layer. "
                     "If False, keep all directions separately and project out each individually."
     )
+    use_shared_basis_from_lora_repos: bool = Field(
+        False,
+        description="If True, build a module-wise shared orthonormal basis from misalignment_lora_repos "
+                    "using QR per model and pooled SVD, then project lora_B weights against that basis."
+    )
+    shared_basis_rank: int = Field(
+        32,
+        description="Maximum rank to keep when constructing a shared basis from misalignment_lora_repos."
+    )
     projection_strength: float = Field(
         1.0,
         description="Strength of weight projection (0.0 to 1.0). 1.0 = full projection"
@@ -195,6 +204,12 @@ class TrainingConfig(BaseModel):
     def validate_projection_every_n_steps(cls, v):
         if v < 1:
             raise ValueError("projection_every_n_steps must be at least 1")
+        return v
+
+    @field_validator("shared_basis_rank")
+    def validate_shared_basis_rank(cls, v):
+        if v < 1:
+            raise ValueError("shared_basis_rank must be at least 1")
         return v
 
     @field_validator("projection_debug_every_n_steps")

@@ -6,8 +6,10 @@ from transformers import TrainingArguments, DataCollatorForSeq2Seq
 from em_organism_dir.finetune.sft.util.weight_projection import (
     WeightProjectionCallback,
     LoRAProjectionCallback,
+    ModuleSharedBasisProjectionCallback,
     load_misalignment_directions_from_file,
     create_lora_subspace_from_lora_models,
+    create_module_shared_basis_from_lora_models,
     create_shared_basis_projection_callback,
 )
 
@@ -59,6 +61,18 @@ def create_weight_projection_callback(training_cfg):
             print(f"[SharedBasisProjection] Loaded directions for {num_layers} basis layers")
             print("[SharedBasisProjection] Projection callback enabled for training")
             return callback
+        elif isinstance(data, dict) and all(hasattr(v, "shape") for v in data.values()):
+            print("[WeightProjection] Detected module-wise shared basis format, using ModuleSharedBasisProjectionCallback")
+            callback = ModuleSharedBasisProjectionCallback(
+                basis_by_module=data,
+                projection_strength=training_cfg.projection_strength,
+                apply_every_n_steps=training_cfg.projection_every_n_steps,
+                verbose=training_cfg.projection_verbose,
+                **common_debug_kwargs,
+            )
+            print(f"[SharedBasisProjection] Loaded module bases for {len(data)} module types")
+            print("[SharedBasisProjection] Projection callback enabled for training")
+            return callback
         else:
             # Use the appropriate callback for regular direction files
             subspace = load_misalignment_directions_from_file(
@@ -105,6 +119,23 @@ def create_weight_projection_callback(training_cfg):
                 "misalignment_lora_repos builds a LoRA-space projection subspace and "
                 "only makes sense when is_peft=True."
             )
+        if getattr(training_cfg, 'use_shared_basis_from_lora_repos', False):
+            print(f"[SharedBasisProjection] Computing module shared basis from {len(training_cfg.misalignment_lora_repos)} LoRA models")
+            basis_by_module = create_module_shared_basis_from_lora_models(
+                training_cfg.misalignment_lora_repos,
+                target_modules=training_cfg.projection_target_modules,
+                quiet=not training_cfg.projection_verbose,
+                target_rank=training_cfg.shared_basis_rank,
+            )
+            callback = ModuleSharedBasisProjectionCallback(
+                basis_by_module=basis_by_module,
+                projection_strength=training_cfg.projection_strength,
+                apply_every_n_steps=training_cfg.projection_every_n_steps,
+                verbose=training_cfg.projection_verbose,
+                **common_debug_kwargs,
+            )
+            print(f"[SharedBasisProjection] Created module shared basis for {len(basis_by_module)} module types")
+            return callback
         print(f"[LoRAProjection] Computing directions from {len(training_cfg.misalignment_lora_repos)} LoRA models")
         print(f"[LoRAProjection] Averaging directions: {training_cfg.average_misalignment_directions}")
 

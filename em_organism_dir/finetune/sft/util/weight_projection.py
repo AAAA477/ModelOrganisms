@@ -27,6 +27,7 @@ LoRA-Space Projection:
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -222,6 +223,85 @@ def orthonormalize_directions(
 
     # Reshape back to original shape
     return [b.view(shape) for b in basis]
+
+
+def axial_align(vectors: List[torch.Tensor]) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Sign-align vectors to a common mean axis.
+
+    This mirrors the notebook logic: normalize each vector, compute a centroid
+    axis, flip vectors with negative dot product, then recompute the centroid.
+    """
+    if not vectors:
+        return [], None
+
+    unit_vectors = []
+    for v in vectors:
+        flat = v.view(-1).float()
+        norm = torch.linalg.norm(flat)
+        unit_vectors.append(flat if norm <= 1e-12 else flat / norm)
+
+    centroid = torch.stack(unit_vectors, dim=0).mean(dim=0)
+    centroid_norm = torch.linalg.norm(centroid)
+    if centroid_norm > 1e-12:
+        centroid = centroid / centroid_norm
+
+    aligned = [u if torch.dot(u, centroid) >= 0 else -u for u in unit_vectors]
+    centroid = torch.stack(aligned, dim=0).mean(dim=0)
+    centroid_norm = torch.linalg.norm(centroid)
+    if centroid_norm > 1e-12:
+        centroid = centroid / centroid_norm
+
+    return aligned, centroid
+
+
+def qr_row_basis(
+    vectors: List[torch.Tensor],
+    tol: float = 1e-7,
+    max_rank: Optional[int] = None,
+) -> torch.Tensor:
+    """Build an orthonormal row basis U (k, d) using thin QR on V^T."""
+    if not vectors:
+        return torch.empty(0, 0, dtype=torch.float32)
+
+    V = torch.stack([v.view(-1).float() for v in vectors], dim=0)  # (n, d)
+    Q, R = torch.linalg.qr(V.T, mode="reduced")
+    diag = torch.diagonal(R).abs()
+    rank = int((diag > tol).sum().item())
+    if max_rank is not None:
+        rank = min(rank, int(max_rank))
+    return Q[:, :rank].T.contiguous().to(dtype=torch.float32)
+
+
+def svd_row_basis(
+    vectors: List[torch.Tensor],
+    max_rank: Optional[int] = None,
+    tol: float = 1e-4,
+) -> torch.Tensor:
+    """Build an orthonormal row basis U (k, d) via uncentered SVD on stacked vectors."""
+    if not vectors:
+        return torch.empty(0, 0, dtype=torch.float32)
+
+    X = torch.stack([v.view(-1).float() for v in vectors], dim=0)  # (n, d)
+    _, singular_values, vh = torch.linalg.svd(X, full_matrices=False)
+    keep = singular_values > tol
+    basis = vh[keep]
+    if max_rank is not None:
+        basis = basis[: int(max_rank)]
+    return basis.contiguous().to(dtype=torch.float32)
+
+
+_LORA_SITE_RE = re.compile(r"layers\.(\d+)\.(self_attn|mlp)\.([^.]+)$")
+
+
+def parse_lora_site(base_name: str) -> Tuple[Optional[int], Optional[str]]:
+    """Extract layer index and site type from a LoRA base name."""
+    match = _LORA_SITE_RE.search(base_name)
+    if not match:
+        return None, None
+    layer_idx = int(match.group(1))
+    site_type = f"{match.group(2)}.{match.group(3)}"
+    return layer_idx, site_type
 
 
 def batch_project_out_subspace(
@@ -1004,6 +1084,76 @@ def create_lora_subspace_from_lora_models(
     return subspace
 
 
+def create_module_shared_basis_from_lora_models(
+    lora_repo_ids: List[str],
+    target_modules: Optional[List[str]] = None,
+    quiet: bool = True,
+    target_rank: int = 32,
+    qr_tol: float = 1e-7,
+    svd_tol: float = 1e-4,
+) -> Dict[str, torch.Tensor]:
+    """
+    Build a module-wise shared orthonormal basis from LoRA B matrices.
+
+    This ports the notebook workflow into LoRA B-space:
+    1. For each model and module type, collect B columns as vectors in output space
+    2. Sign-align those vectors and build a per-model QR basis
+    3. Pool the QR bases across models and run SVD to get a shared basis
+
+    Returns:
+        Dict like {"self_attn.q_proj": basis, ...} where each basis is (k, hidden_size)
+    """
+    from em_organism_dir.lora_interp.lora_utils import download_lora_weights, load_lora_state_dict
+
+    site_qr_bases: Dict[str, List[torch.Tensor]] = {}
+
+    for repo_id in lora_repo_ids:
+        try:
+            print(f"[SharedBasisProjection] Loading LoRA from: {repo_id}")
+            lora_path, config = download_lora_weights(repo_id, quiet=quiet)
+            state_dict = load_lora_state_dict(lora_path)
+            components = extract_all_lora_components_from_state_dict(state_dict, config, target_modules)
+
+            per_site_vectors: Dict[str, List[torch.Tensor]] = {}
+            for base_name, comp in components.items():
+                _, site_type = parse_lora_site(base_name)
+                if site_type is None:
+                    continue
+
+                B = comp["B"].float()
+                for col_idx in range(B.shape[1]):
+                    per_site_vectors.setdefault(site_type, []).append(B[:, col_idx].clone())
+
+            for site_type, vectors in per_site_vectors.items():
+                aligned, _ = axial_align(vectors)
+                basis = qr_row_basis(aligned, tol=qr_tol, max_rank=target_rank)
+                if basis.numel() > 0:
+                    site_qr_bases.setdefault(site_type, []).append(basis.cpu())
+                    print(
+                        f"[SharedBasisProjection] {repo_id} {site_type}: "
+                        f"QR basis shape {tuple(basis.shape)}"
+                    )
+
+        except Exception as e:
+            print(f"Warning: Failed to load LoRA from {repo_id}: {e}")
+
+    shared_bases: Dict[str, torch.Tensor] = {}
+    for site_type, bases in site_qr_bases.items():
+        pooled_vectors = [row for basis in bases for row in basis]
+        shared_basis = svd_row_basis(
+            pooled_vectors, max_rank=target_rank, tol=svd_tol
+        )
+        if shared_basis.numel() > 0:
+            shared_bases[site_type] = shared_basis.cpu()
+            print(
+                f"[SharedBasisProjection] {site_type}: pooled {len(pooled_vectors)} vectors "
+                f"-> shared basis shape {tuple(shared_basis.shape)}"
+            )
+
+    print(f"[SharedBasisProjection] Created shared module basis for {len(shared_bases)} module types")
+    return shared_bases
+
+
 class LoRAProjectionCallback(TrainerCallback):
     """
     HuggingFace Trainer callback that projects out misalignment directions
@@ -1320,6 +1470,215 @@ class LoRAProjectionCallback(TrainerCallback):
 # =============================================================================
 # Shared Basis Projection (for RFA-style shared basis directions)
 # =============================================================================
+
+
+class ModuleSharedBasisProjectionCallback(TrainerCallback):
+    """
+    Project LoRA B weights against a module-wise shared basis.
+
+    The basis is shared across all layers for a given module family
+    (for example, all `self_attn.q_proj` B matrices share one basis).
+    """
+
+    def __init__(
+        self,
+        basis_by_module: Dict[str, torch.Tensor],
+        projection_strength: float = 1.0,
+        apply_every_n_steps: int = 1,
+        verbose: bool = False,
+        debug: bool = False,
+        debug_every_n_steps: int = 1,
+        debug_max_layers: int = 8,
+    ):
+        self.basis_by_module = basis_by_module
+        self.projection_strength = projection_strength
+        self.apply_every_n_steps = apply_every_n_steps
+        self.verbose = verbose
+        self.debug = debug
+        self.debug_every_n_steps = debug_every_n_steps
+        self.debug_max_layers = debug_max_layers
+        self._step_count = 0
+        self._initialized = False
+        self._param_mapping: Dict[str, Tuple[torch.nn.Parameter, str]] = {}
+        self._debug_grad_stats: Dict[str, Dict[str, float]] = {}
+
+    def _get_short_name(self, full_name: str) -> Optional[str]:
+        for module_name in self.basis_by_module:
+            if module_name in full_name:
+                return module_name
+        return None
+
+    def _initialize_mappings(self, model: torch.nn.Module):
+        self._param_mapping = {}
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'lora_B' not in name or not name.endswith('.weight'):
+                continue
+
+            module_name = self._get_short_name(name)
+            if module_name is None:
+                continue
+            self._param_mapping[name] = (param, module_name)
+            if self.verbose:
+                print(f"[SharedBasisProjection] Mapped {name} -> module basis[{module_name}]")
+
+        if len(self._param_mapping) > 0:
+            sample_param = next(iter(self._param_mapping.values()))[0]
+            orthonormalized = {}
+            for key, basis in self.basis_by_module.items():
+                basis = basis.to(device=sample_param.device, dtype=sample_param.dtype)
+                rows = orthonormalize_directions([row for row in basis])
+                if len(rows) > 0:
+                    orthonormalized[key] = torch.stack(rows, dim=0)
+                else:
+                    orthonormalized[key] = torch.zeros(
+                        (1, basis.shape[-1]),
+                        device=sample_param.device,
+                        dtype=sample_param.dtype,
+                    )
+            self.basis_by_module = orthonormalized
+
+        self._initialized = True
+        print(f"[SharedBasisProjection] Initialized with {len(self._param_mapping)} parameters mapped")
+
+    def _project_with_basis(self, weight: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+        if basis.ndim == 1:
+            basis = basis.unsqueeze(0)
+
+        if basis.shape[1] == weight.shape[0]:
+            coeffs = basis @ weight
+            projection = basis.t() @ coeffs
+            return weight - projection
+
+        if basis.shape[1] == weight.numel():
+            flat = weight.view(-1).float()
+            basis_f = basis.float()
+            coeffs = basis_f @ flat
+            projection = basis_f.t() @ coeffs
+            return (flat - projection).view_as(weight).to(weight.dtype)
+
+        return weight
+
+    def _basis_component_norm_for_weight(self, weight: torch.Tensor, basis: torch.Tensor) -> Tuple[float, float]:
+        if basis.ndim == 1:
+            basis = basis.unsqueeze(0)
+        if basis.shape[1] == weight.shape[0]:
+            return _basis_component_norm(weight, basis)
+        if basis.shape[1] == weight.numel():
+            return _subspace_component_norm(
+                weight, [MisalignmentDirection(row.view(-1), "tmp") for row in basis]
+            )
+        total_norm = torch.norm(weight.detach().float()).item()
+        return total_norm, 0.0
+
+    def _apply_projection(self, model: torch.nn.Module):
+        total_projection_norm = 0.0
+        num_projected = 0
+        debug_rows = []
+
+        for name, (param, module_name) in self._param_mapping.items():
+            basis = self.basis_by_module.get(module_name)
+            if basis is None or basis.numel() == 0:
+                continue
+
+            with torch.no_grad():
+                original_weight = param.data.clone()
+                projected_weight = self._project_with_basis(param.data, basis)
+                if self.projection_strength < 1.0:
+                    param.data = (
+                        self.projection_strength * projected_weight +
+                        (1.0 - self.projection_strength) * original_weight
+                    )
+                else:
+                    param.data = projected_weight
+
+                diff = original_weight - param.data
+                total_projection_norm += torch.norm(diff).item()
+                num_projected += 1
+
+                if self.debug and self._step_count % self.debug_every_n_steps == 0:
+                    weight_norm_before, blocked_before = self._basis_component_norm_for_weight(original_weight, basis)
+                    weight_norm_after, blocked_after = self._basis_component_norm_for_weight(param.data, basis)
+                    grad_stats = self._debug_grad_stats.get(name, {})
+                    debug_rows.append(
+                        {
+                            "layer_name": name,
+                            "grad_norm": grad_stats.get("grad_norm", 0.0),
+                            "grad_blocked_norm": grad_stats.get("grad_blocked_norm", 0.0),
+                            "weight_norm_before": weight_norm_before,
+                            "blocked_before": blocked_before,
+                            "weight_norm_after": weight_norm_after,
+                            "blocked_after": blocked_after,
+                            "removed_norm": torch.norm(diff).item(),
+                        }
+                    )
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_projection_norm / num_projected
+            print(f"[SharedBasisProjection] Step {self._step_count}: Projected {num_projected} params, avg norm change: {avg_norm:.6f}")
+        if debug_rows:
+            rows = sorted(debug_rows, key=lambda row: row["blocked_before"], reverse=True)
+            print(f"[SharedBasisProjection][Debug] Step {self._step_count}: showing top {min(len(rows), self.debug_max_layers)} params")
+            for row in rows[:self.debug_max_layers]:
+                print(
+                    f"[SharedBasisProjection][Debug] {row['layer_name']}: "
+                    f"grad blocked {row['grad_blocked_norm']:.6f}/{row['grad_norm']:.6f} "
+                    f"({_format_ratio(row['grad_blocked_norm'], row['grad_norm'])}), "
+                    f"weight blocked {row['blocked_before']:.6f}/{row['weight_norm_before']:.6f} -> "
+                    f"{row['blocked_after']:.6f}/{row['weight_norm_after']:.6f} "
+                    f"(removed {row['removed_norm']:.6f})"
+                )
+
+    def on_pre_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        if not self.debug or model is None:
+            return
+        if not self._initialized:
+            self._initialize_mappings(model)
+
+        upcoming_step = self._step_count + 1
+        if upcoming_step % self.apply_every_n_steps != 0:
+            return
+        if upcoming_step % self.debug_every_n_steps != 0:
+            return
+
+        self._debug_grad_stats = {}
+        for name, (param, module_name) in self._param_mapping.items():
+            if param.grad is None:
+                continue
+            basis = self.basis_by_module.get(module_name)
+            if basis is None or basis.numel() == 0:
+                continue
+            grad_norm, grad_blocked_norm = self._basis_component_norm_for_weight(param.grad, basis)
+            self._debug_grad_stats[name] = {
+                "grad_norm": grad_norm,
+                "grad_blocked_norm": grad_blocked_norm,
+            }
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        self._step_count += 1
+        if model is None:
+            return
+        if not self._initialized:
+            self._initialize_mappings(model)
+        if self._step_count % self.apply_every_n_steps != 0:
+            return
+        self._apply_projection(model)
 
 def load_shared_basis_from_file(
     filepath: Union[str, Path],
