@@ -55,6 +55,8 @@ def create_weight_projection_callback(training_cfg):
                 projection_strength=training_cfg.projection_strength,
                 apply_every_n_steps=training_cfg.projection_every_n_steps,
                 verbose=training_cfg.projection_verbose,
+                project_gradients=getattr(training_cfg, 'project_gradients', False),
+                gradient_projection_strength=getattr(training_cfg, 'gradient_projection_strength', 1.0),
                 **common_debug_kwargs,
             )
             num_layers = data['basis_directions'].shape[0]
@@ -68,6 +70,8 @@ def create_weight_projection_callback(training_cfg):
                 projection_strength=training_cfg.projection_strength,
                 apply_every_n_steps=training_cfg.projection_every_n_steps,
                 verbose=training_cfg.projection_verbose,
+                project_gradients=getattr(training_cfg, 'project_gradients', False),
+                gradient_projection_strength=getattr(training_cfg, 'gradient_projection_strength', 1.0),
                 **common_debug_kwargs,
             )
             print(f"[SharedBasisProjection] Loaded module bases for {len(data)} module types")
@@ -94,6 +98,8 @@ def create_weight_projection_callback(training_cfg):
                     )
 
                 project_opt_states = getattr(training_cfg, 'project_optimizer_states', True)
+                project_gradients = getattr(training_cfg, 'project_gradients', False)
+                gradient_projection_strength = getattr(training_cfg, 'gradient_projection_strength', 1.0)
                 project_second_moment = getattr(training_cfg, 'project_second_moment', False)
                 callback = LoRAProjectionCallback(
                     misalignment_subspace=subspace,
@@ -101,6 +107,8 @@ def create_weight_projection_callback(training_cfg):
                     apply_every_n_steps=training_cfg.projection_every_n_steps,
                     verbose=training_cfg.projection_verbose,
                     project_optimizer_states=project_opt_states,
+                    project_gradients=project_gradients,
+                    gradient_projection_strength=gradient_projection_strength,
                     project_second_moment=project_second_moment,
                     **common_debug_kwargs,
                 )
@@ -132,6 +140,8 @@ def create_weight_projection_callback(training_cfg):
                 projection_strength=training_cfg.projection_strength,
                 apply_every_n_steps=training_cfg.projection_every_n_steps,
                 verbose=training_cfg.projection_verbose,
+                project_gradients=getattr(training_cfg, 'project_gradients', False),
+                gradient_projection_strength=getattr(training_cfg, 'gradient_projection_strength', 1.0),
                 **common_debug_kwargs,
             )
             print(f"[SharedBasisProjection] Created module shared basis for {len(basis_by_module)} module types")
@@ -148,9 +158,12 @@ def create_weight_projection_callback(training_cfg):
         )
 
         project_opt_states = getattr(training_cfg, 'project_optimizer_states', True)
+        project_gradients = getattr(training_cfg, 'project_gradients', False)
+        gradient_projection_strength = getattr(training_cfg, 'gradient_projection_strength', 1.0)
         project_second_moment = getattr(training_cfg, 'project_second_moment', False)
         print(f"[LoRAProjection] Using LoRA-space weight projection (operating on A and B matrices directly)")
         print(f"[LoRAProjection] Project optimizer states: {project_opt_states}")
+        print(f"[LoRAProjection] Project gradients: {project_gradients}")
         if project_opt_states:
             print(f"[LoRAProjection] Project second moment (heuristic): {project_second_moment}")
         callback = LoRAProjectionCallback(
@@ -159,6 +172,8 @@ def create_weight_projection_callback(training_cfg):
             apply_every_n_steps=training_cfg.projection_every_n_steps,
             verbose=training_cfg.projection_verbose,
             project_optimizer_states=project_opt_states,
+            project_gradients=project_gradients,
+            gradient_projection_strength=gradient_projection_strength,
             project_second_moment=project_second_moment,
             **common_debug_kwargs,
         )

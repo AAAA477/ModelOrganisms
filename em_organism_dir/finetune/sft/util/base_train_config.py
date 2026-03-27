@@ -121,6 +121,17 @@ class TrainingConfig(BaseModel):
                     "pushing weights back toward it on subsequent steps. Only applies when using "
                     "weight projection (not gradient projection)."
     )
+    project_gradients: bool = Field(
+        False,
+        description="If True, project gradients out of the blocked subspace before each optimizer "
+                    "step. This prevents Adam from spending update budget on forbidden directions "
+                    "instead of only cleaning them up after the step."
+    )
+    gradient_projection_strength: float = Field(
+        1.0,
+        description="Strength of pre-step gradient projection (0.0 to 1.0). "
+                    "1.0 = full projection, 0.0 = disabled in effect."
+    )
     project_second_moment: bool = Field(
         False,
         description="If True, also project Adam's second-moment estimate (exp_avg_sq). "
@@ -198,6 +209,12 @@ class TrainingConfig(BaseModel):
     def validate_projection_strength(cls, v):
         if not 0.0 <= v <= 1.0:
             raise ValueError("Projection strength must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("gradient_projection_strength")
+    def validate_gradient_projection_strength(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("gradient_projection_strength must be between 0.0 and 1.0")
         return v
 
     @field_validator("projection_every_n_steps")

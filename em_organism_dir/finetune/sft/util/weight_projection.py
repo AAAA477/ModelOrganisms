@@ -1174,6 +1174,8 @@ class LoRAProjectionCallback(TrainerCallback):
         apply_every_n_steps: int = 1,
         verbose: bool = False,
         project_optimizer_states: bool = True,
+        project_gradients: bool = False,
+        gradient_projection_strength: float = 1.0,
         project_second_moment: bool = False,
         debug: bool = False,
         debug_every_n_steps: int = 1,
@@ -1191,6 +1193,10 @@ class LoRAProjectionCallback(TrainerCallback):
                 from Adam's first moment (exp_avg / momentum). This prevents the
                 optimizer from "remembering" the misalignment direction and pushing
                 back harder each step.
+            project_gradients: If True, project gradients before the optimizer step
+                so forbidden components never reach Adam in the first place.
+            gradient_projection_strength: How much of the gradient projection to
+                apply (0.0 to 1.0).
             project_second_moment: If True, also project Adam's second-moment
                 estimate (exp_avg_sq). This is a heuristic rather than an exact
                 projection because squared-gradient statistics are not linear.
@@ -1203,6 +1209,8 @@ class LoRAProjectionCallback(TrainerCallback):
         self.apply_every_n_steps = apply_every_n_steps
         self.verbose = verbose
         self.project_optimizer_states = project_optimizer_states
+        self.project_gradients = project_gradients
+        self.gradient_projection_strength = gradient_projection_strength
         self.project_second_moment = project_second_moment
         self.debug = debug
         self.debug_every_n_steps = debug_every_n_steps
@@ -1265,6 +1273,45 @@ class LoRAProjectionCallback(TrainerCallback):
     ) -> torch.Tensor:
         """Project out misalignment directions from a single tensor (weight or optimizer state)."""
         return batch_project_out_subspace(tensor, directions, _cached_basis=cached_basis)
+
+    def _project_gradients(self):
+        """Project gradients before the optimizer step so forbidden components are never applied."""
+        if not self.project_gradients or self.gradient_projection_strength <= 0.0:
+            return
+
+        total_projection_norm = 0.0
+        num_projected = 0
+
+        for layer_name, param in self._layer_to_param.items():
+            if param.grad is None:
+                continue
+
+            directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+            if not directions:
+                continue
+
+            cached = self._cached_bases.get(layer_name)
+            with torch.no_grad():
+                original_grad = param.grad.data.clone()
+                projected_grad = self._project_single_tensor(
+                    param.grad.data, directions, cached
+                )
+
+                if self.gradient_projection_strength < 1.0:
+                    param.grad.data = (
+                        self.gradient_projection_strength * projected_grad +
+                        (1.0 - self.gradient_projection_strength) * original_grad
+                    )
+                else:
+                    param.grad.data = projected_grad
+
+                total_projection_norm += torch.norm(original_grad - param.grad.data).item()
+                num_projected += 1
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_projection_norm / num_projected
+            print(f"[LoRAProjection] Step {self._step_count + 1}: "
+                  f"Projected gradients for {num_projected} layers, avg norm change: {avg_norm:.6f}")
 
     def _project_optimizer_state_for_param(
         self, param: torch.nn.Parameter, directions: List[MisalignmentDirection],
@@ -1415,7 +1462,7 @@ class LoRAProjectionCallback(TrainerCallback):
         **kwargs
     ):
         """Capture gradient overlap with blocked directions before the optimizer step."""
-        if not self.debug or model is None:
+        if model is None:
             return
 
         if not self._initialized:
@@ -1424,24 +1471,25 @@ class LoRAProjectionCallback(TrainerCallback):
         upcoming_step = self._step_count + 1
         if upcoming_step % self.apply_every_n_steps != 0:
             return
-        if upcoming_step % self.debug_every_n_steps != 0:
-            return
 
-        self._debug_grad_stats = {}
-        for layer_name, param in self._layer_to_param.items():
-            if param.grad is None:
-                continue
-            directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
-            if not directions:
-                continue
-            cached = self._cached_bases.get(layer_name)
-            grad_norm, grad_blocked_norm = _subspace_component_norm(
-                param.grad, directions, cached
-            )
-            self._debug_grad_stats[layer_name] = {
-                "grad_norm": grad_norm,
-                "grad_blocked_norm": grad_blocked_norm,
-            }
+        if self.debug and upcoming_step % self.debug_every_n_steps == 0:
+            self._debug_grad_stats = {}
+            for layer_name, param in self._layer_to_param.items():
+                if param.grad is None:
+                    continue
+                directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+                if not directions:
+                    continue
+                cached = self._cached_bases.get(layer_name)
+                grad_norm, grad_blocked_norm = _subspace_component_norm(
+                    param.grad, directions, cached
+                )
+                self._debug_grad_stats[layer_name] = {
+                    "grad_norm": grad_norm,
+                    "grad_blocked_norm": grad_blocked_norm,
+                }
+
+        self._project_gradients()
 
     def on_step_end(
         self,
@@ -1486,6 +1534,8 @@ class ModuleSharedBasisProjectionCallback(TrainerCallback):
         projection_strength: float = 1.0,
         apply_every_n_steps: int = 1,
         verbose: bool = False,
+        project_gradients: bool = False,
+        gradient_projection_strength: float = 1.0,
         debug: bool = False,
         debug_every_n_steps: int = 1,
         debug_max_layers: int = 8,
@@ -1494,6 +1544,8 @@ class ModuleSharedBasisProjectionCallback(TrainerCallback):
         self.projection_strength = projection_strength
         self.apply_every_n_steps = apply_every_n_steps
         self.verbose = verbose
+        self.project_gradients = project_gradients
+        self.gradient_projection_strength = gradient_projection_strength
         self.debug = debug
         self.debug_every_n_steps = debug_every_n_steps
         self.debug_max_layers = debug_max_layers
@@ -1573,6 +1625,40 @@ class ModuleSharedBasisProjectionCallback(TrainerCallback):
         total_norm = torch.norm(weight.detach().float()).item()
         return total_norm, 0.0
 
+    def _project_gradients(self):
+        if not self.project_gradients or self.gradient_projection_strength <= 0.0:
+            return
+
+        total_projection_norm = 0.0
+        num_projected = 0
+
+        for name, (param, module_name) in self._param_mapping.items():
+            if param.grad is None:
+                continue
+
+            basis = self.basis_by_module.get(module_name)
+            if basis is None or basis.numel() == 0:
+                continue
+
+            with torch.no_grad():
+                original_grad = param.grad.data.clone()
+                projected_grad = self._project_with_basis(param.grad.data, basis)
+                if self.gradient_projection_strength < 1.0:
+                    param.grad.data = (
+                        self.gradient_projection_strength * projected_grad +
+                        (1.0 - self.gradient_projection_strength) * original_grad
+                    )
+                else:
+                    param.grad.data = projected_grad
+
+                total_projection_norm += torch.norm(original_grad - param.grad.data).item()
+                num_projected += 1
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_projection_norm / num_projected
+            print(f"[SharedBasisProjection] Step {self._step_count + 1}: "
+                  f"Projected gradients for {num_projected} params, avg norm change: {avg_norm:.6f}")
+
     def _apply_projection(self, model: torch.nn.Module):
         total_projection_norm = 0.0
         num_projected = 0
@@ -1639,7 +1725,7 @@ class ModuleSharedBasisProjectionCallback(TrainerCallback):
         model: torch.nn.Module = None,
         **kwargs
     ):
-        if not self.debug or model is None:
+        if model is None:
             return
         if not self._initialized:
             self._initialize_mappings(model)
@@ -1647,21 +1733,22 @@ class ModuleSharedBasisProjectionCallback(TrainerCallback):
         upcoming_step = self._step_count + 1
         if upcoming_step % self.apply_every_n_steps != 0:
             return
-        if upcoming_step % self.debug_every_n_steps != 0:
-            return
 
-        self._debug_grad_stats = {}
-        for name, (param, module_name) in self._param_mapping.items():
-            if param.grad is None:
-                continue
-            basis = self.basis_by_module.get(module_name)
-            if basis is None or basis.numel() == 0:
-                continue
-            grad_norm, grad_blocked_norm = self._basis_component_norm_for_weight(param.grad, basis)
-            self._debug_grad_stats[name] = {
-                "grad_norm": grad_norm,
-                "grad_blocked_norm": grad_blocked_norm,
-            }
+        if self.debug and upcoming_step % self.debug_every_n_steps == 0:
+            self._debug_grad_stats = {}
+            for name, (param, module_name) in self._param_mapping.items():
+                if param.grad is None:
+                    continue
+                basis = self.basis_by_module.get(module_name)
+                if basis is None or basis.numel() == 0:
+                    continue
+                grad_norm, grad_blocked_norm = self._basis_component_norm_for_weight(param.grad, basis)
+                self._debug_grad_stats[name] = {
+                    "grad_norm": grad_norm,
+                    "grad_blocked_norm": grad_blocked_norm,
+                }
+
+        self._project_gradients()
 
     def on_step_end(
         self,
@@ -1737,6 +1824,8 @@ class SharedBasisProjectionCallback(TrainerCallback):
         projection_strength: float = 1.0,
         apply_every_n_steps: int = 1,
         verbose: bool = False,
+        project_gradients: bool = False,
+        gradient_projection_strength: float = 1.0,
         debug: bool = False,
         debug_every_n_steps: int = 1,
         debug_max_layers: int = 8,
@@ -1751,6 +1840,8 @@ class SharedBasisProjectionCallback(TrainerCallback):
             projection_strength: How much of the projection to apply (0.0 to 1.0)
             apply_every_n_steps: Apply projection every N optimizer steps
             verbose: If True, print projection statistics
+            project_gradients: If True, project gradients before the optimizer step.
+            gradient_projection_strength: How much of the gradient projection to apply.
             debug: If True, print per-layer gradient and weight projection diagnostics.
             debug_every_n_steps: Print diagnostics every N optimizer steps.
             debug_max_layers: Maximum number of parameters to print per diagnostic step.
@@ -1761,6 +1852,8 @@ class SharedBasisProjectionCallback(TrainerCallback):
         self.projection_strength = projection_strength
         self.apply_every_n_steps = apply_every_n_steps
         self.verbose = verbose
+        self.project_gradients = project_gradients
+        self.gradient_projection_strength = gradient_projection_strength
         self.debug = debug
         self.debug_every_n_steps = debug_every_n_steps
         self.debug_max_layers = debug_max_layers
@@ -1867,6 +1960,38 @@ class SharedBasisProjectionCallback(TrainerCallback):
 
         return weight - projection
 
+    def _project_gradients(self):
+        if not self.project_gradients or self.gradient_projection_strength <= 0.0:
+            return
+
+        total_projection_norm = 0.0
+        num_projected = 0
+
+        for _, (param, basis_idx) in self._param_mapping.items():
+            if param.grad is None:
+                continue
+
+            basis = self._orthonormal_basis_directions[basis_idx]
+            with torch.no_grad():
+                original_grad = param.grad.data.clone()
+                projected_grad = self._project_out_basis(param.grad.data, basis)
+
+                if self.gradient_projection_strength < 1.0:
+                    param.grad.data = (
+                        self.gradient_projection_strength * projected_grad +
+                        (1.0 - self.gradient_projection_strength) * original_grad
+                    )
+                else:
+                    param.grad.data = projected_grad
+
+                total_projection_norm += torch.norm(original_grad - param.grad.data).item()
+                num_projected += 1
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_projection_norm / num_projected
+            print(f"[SharedBasisProjection] Step {self._step_count + 1}: "
+                  f"Projected gradients for {num_projected} params, avg norm change: {avg_norm:.6f}")
+
     def _apply_projection(self, model: torch.nn.Module):
         """Apply projection to all mapped parameters."""
         total_projection_norm = 0.0
@@ -1940,7 +2065,7 @@ class SharedBasisProjectionCallback(TrainerCallback):
         **kwargs
     ):
         """Capture gradient overlap with the shared basis before the optimizer step."""
-        if not self.debug or model is None:
+        if model is None:
             return
 
         if not self._initialized:
@@ -1949,19 +2074,20 @@ class SharedBasisProjectionCallback(TrainerCallback):
         upcoming_step = self._step_count + 1
         if upcoming_step % self.apply_every_n_steps != 0:
             return
-        if upcoming_step % self.debug_every_n_steps != 0:
-            return
 
-        self._debug_grad_stats = {}
-        for name, (param, basis_idx) in self._param_mapping.items():
-            if param.grad is None:
-                continue
-            basis = self._orthonormal_basis_directions[basis_idx]
-            grad_norm, grad_blocked_norm = _basis_component_norm(param.grad, basis)
-            self._debug_grad_stats[name] = {
-                "grad_norm": grad_norm,
-                "grad_blocked_norm": grad_blocked_norm,
-            }
+        if self.debug and upcoming_step % self.debug_every_n_steps == 0:
+            self._debug_grad_stats = {}
+            for name, (param, basis_idx) in self._param_mapping.items():
+                if param.grad is None:
+                    continue
+                basis = self._orthonormal_basis_directions[basis_idx]
+                grad_norm, grad_blocked_norm = _basis_component_norm(param.grad, basis)
+                self._debug_grad_stats[name] = {
+                    "grad_norm": grad_norm,
+                    "grad_blocked_norm": grad_blocked_norm,
+                }
+
+        self._project_gradients()
 
     def on_step_end(
         self,
@@ -1991,6 +2117,8 @@ def create_shared_basis_projection_callback(
     projection_strength: float = 1.0,
     apply_every_n_steps: int = 1,
     verbose: bool = False,
+    project_gradients: bool = False,
+    gradient_projection_strength: float = 1.0,
     debug: bool = False,
     debug_every_n_steps: int = 1,
     debug_max_layers: int = 8,
@@ -2003,6 +2131,8 @@ def create_shared_basis_projection_callback(
         projection_strength: How much projection to apply (0-1)
         apply_every_n_steps: Apply every N steps
         verbose: Print debug info
+        project_gradients: Whether to project gradients before the optimizer step
+        gradient_projection_strength: How much gradient projection to apply
         debug: Print per-layer gradient and weight diagnostics
         debug_every_n_steps: Print diagnostics every N steps
         debug_max_layers: Maximum number of params to print per diagnostic step
@@ -2031,6 +2161,8 @@ def create_shared_basis_projection_callback(
         projection_strength=projection_strength,
         apply_every_n_steps=apply_every_n_steps,
         verbose=verbose,
+        project_gradients=project_gradients,
+        gradient_projection_strength=gradient_projection_strength,
         debug=debug,
         debug_every_n_steps=debug_every_n_steps,
         debug_max_layers=debug_max_layers,
